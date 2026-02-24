@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,13 +27,12 @@ var (
 func main() {
 	certBase64 := os.Getenv("APNS_CERT_BASE64")
 	certPassword := os.Getenv("APNS_CERT_PASSWORD")
-	tokensStr := os.Getenv("DEVICE_TOKENS")
 	bundleID := os.Getenv("APNS_TOPIC")
 	env := os.Getenv("APNS_ENVIRONMENT")
 	authKey := os.Getenv("AUTH_KEY")
 
-	if certBase64 == "" || certPassword == "" || tokensStr == "" || bundleID == "" || env == "" {
-		log.Fatal("Не все обязательные переменные окружения установлены")
+	if certBase64 == "" || certPassword == "" || bundleID == "" || env == "" {
+		log.Fatal("Не все обязательные переменные окружения установлены: нужны APNS_CERT_BASE64, APNS_CERT_PASSWORD, APNS_TOPIC, APNS_ENVIRONMENT")
 	}
 
 	certData, err := base64.StdEncoding.DecodeString(certBase64)
@@ -54,12 +52,6 @@ func main() {
 		client = client.Development()
 	}
 
-	deviceTokens := strings.Split(tokensStr, ",")
-	for i, t := range deviceTokens {
-		deviceTokens[i] = strings.TrimSpace(t)
-	}
-	log.Printf("Загружено %d device token'ов", len(deviceTokens))
-
 	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -71,36 +63,47 @@ func main() {
 			return
 		}
 
+		var req struct {
+			DeviceToken string `json:"device_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.DeviceToken == "" {
+			http.Error(w, "device_token is required", http.StatusBadRequest)
+			return
+		}
+
 		pl := payload.NewPayload().ContentAvailable()
 
 		notification := &apns2.Notification{
-			Topic:      bundleID,
-			Priority:   apns2.PriorityLow,
-			PushType:   apns2.PushTypeBackground,
-			Payload:    pl,
-			Expiration: time.Now().Add(24 * time.Hour),
+			DeviceToken: req.DeviceToken,
+			Topic:       bundleID,
+			Priority:    apns2.PriorityLow,
+			PushType:    apns2.PushTypeBackground,
+			Payload:     pl,
+			Expiration:  time.Now().Add(24 * time.Hour),
 		}
 
-		results := make(map[string]string)
-		for _, token := range deviceTokens {
-			notification.DeviceToken = token
-			resp, err := client.Push(notification)
-			if err != nil {
-				results[token] = "error: " + err.Error()
-				log.Printf("Ошибка отправки для %s: %v", token, err)
-				continue
-			}
-			if resp.StatusCode == 200 {
-				results[token] = "success"
-				log.Printf("Успешно отправлено на %s", token)
-			} else {
-				results[token] = resp.Reason
-				log.Printf("Ошибка APNs для %s: %s", token, resp.Reason)
-			}
+		resp, err := client.Push(notification)
+
+		result := make(map[string]string)
+		if err != nil {
+			result["status"] = "error"
+			result["reason"] = err.Error()
+			log.Printf("Ошибка отправки для %s: %v", req.DeviceToken, err)
+		} else if resp.StatusCode == 200 {
+			result["status"] = "success"
+			log.Printf("Успешно отправлено на %s", req.DeviceToken)
+		} else {
+			result["status"] = "apns_error"
+			result["reason"] = resp.Reason
+			log.Printf("Ошибка APNs для %s: %s", req.DeviceToken, resp.Reason)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(results)
+		json.NewEncoder(w).Encode(result)
 	})
 
 	http.HandleFunc("/confirm", func(w http.ResponseWriter, r *http.Request) {
