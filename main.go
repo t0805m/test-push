@@ -15,18 +15,83 @@ import (
 	"github.com/sideshow/apns2/payload"
 )
 
-// Структура для хранения подтверждения со счётчиком
-type Confirmation struct {
-	DeviceToken string    `json:"device_token"`
-	Count       int       `json:"count"`       // сколько раз подтвердил
-	LastSeen    time.Time `json:"last_seen"`   // время последнего подтверждения
+// DeviceStats хранит статистику по устройству
+type DeviceStats struct {
+	DeviceToken    string    `json:"device_token"`
+	SilentSent     int       `json:"silent_sent"`      // отправлено silent
+	AlertSent      int       `json:"alert_sent"`       // отправлено alert
+	Confirmed      int       `json:"confirmed"`        // получено подтверждений
+	LastSilentSent time.Time `json:"last_silent_sent"` // время последнего silent
+	LastAlertSent  time.Time `json:"last_alert_sent"`  // время последнего alert
+	LastConfirmed  time.Time `json:"last_confirmed"`   // время последнего подтверждения
 }
 
-// Хранилище подтверждений в памяти
+// Хранилище статистики
 var (
-	confirmations = make(map[string]*Confirmation) // храним указатель для удобства обновления
-	mu            sync.RWMutex
+	statsMap = make(map[string]*DeviceStats)
+	mu       sync.RWMutex
 )
+
+// updateSentStats обновляет счётчик отправок в зависимости от типа
+func updateSentStats(token, pushType string) {
+	mu.Lock()
+	defer mu.Unlock()
+	stats, exists := statsMap[token]
+	if !exists {
+		stats = &DeviceStats{DeviceToken: token}
+		statsMap[token] = stats
+	}
+	now := time.Now()
+	switch pushType {
+	case "silent":
+		stats.SilentSent++
+		stats.LastSilentSent = now
+	case "alert":
+		stats.AlertSent++
+		stats.LastAlertSent = now
+	}
+}
+
+// updateConfirmStats обновляет счётчик подтверждений
+func updateConfirmStats(token string) {
+	mu.Lock()
+	defer mu.Unlock()
+	stats, exists := statsMap[token]
+	if !exists {
+		stats = &DeviceStats{DeviceToken: token}
+		statsMap[token] = stats
+	}
+	stats.Confirmed++
+	stats.LastConfirmed = time.Now()
+}
+
+// getConfirmations возвращает список подтверждений (для обратной совместимости)
+func getConfirmations() []map[string]interface{} {
+	mu.RLock()
+	defer mu.RUnlock()
+	list := make([]map[string]interface{}, 0, len(statsMap))
+	for _, s := range statsMap {
+		if s.Confirmed > 0 {
+			list = append(list, map[string]interface{}{
+				"device_token": s.DeviceToken,
+				"count":        s.Confirmed,
+				"last_seen":    s.LastConfirmed,
+			})
+		}
+	}
+	return list
+}
+
+// getAllStats возвращает полную статистику
+func getAllStats() []*DeviceStats {
+	mu.RLock()
+	defer mu.RUnlock()
+	list := make([]*DeviceStats, 0, len(statsMap))
+	for _, s := range statsMap {
+		list = append(list, s)
+	}
+	return list
+}
 
 func main() {
 	// Загружаем конфигурацию из переменных окружения
@@ -128,6 +193,7 @@ func main() {
 		} else if resp.StatusCode == 200 {
 			result["status"] = "success"
 			log.Printf("Успешно отправлено на %s", req.DeviceToken)
+			updateSentStats(req.DeviceToken, "silent")
 		} else {
 			result["status"] = "apns_error"
 			result["reason"] = resp.Reason
@@ -205,6 +271,7 @@ func main() {
 		} else if resp.StatusCode == 200 {
 			result["status"] = "success"
 			log.Printf("Успешно отправлен обычный пуш на %s", req.DeviceToken)
+			updateSentStats(req.DeviceToken, "alert")
 		} else {
 			result["status"] = "apns_error"
 			result["reason"] = resp.Reason
@@ -239,27 +306,13 @@ func main() {
 			return
 		}
 
-		mu.Lock()
-		// Ищем существующую запись
-		if conf, ok := confirmations[req.DeviceToken]; ok {
-			conf.Count++
-			conf.LastSeen = time.Now()
-		} else {
-			// Создаём новую
-			confirmations[req.DeviceToken] = &Confirmation{
-				DeviceToken: req.DeviceToken,
-				Count:       1,
-				LastSeen:    time.Now(),
-			}
-		}
-		mu.Unlock()
-
+		updateConfirmStats(req.DeviceToken)
 		log.Printf("Получено подтверждение от устройства %s", req.DeviceToken)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"confirmed"}`))
 	})
 
-	// Эндпоинт для просмотра всех подтверждений со счётчиками
+	// Эндпоинт для просмотра только подтверждений (как раньше)
 	http.HandleFunc("/confirmations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -271,13 +324,24 @@ func main() {
 			return
 		}
 
-		mu.RLock()
-		list := make([]*Confirmation, 0, len(confirmations))
-		for _, conf := range confirmations {
-			list = append(list, conf)
-		}
-		mu.RUnlock()
+		list := getConfirmations()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+	})
 
+	// Эндпоинт для полной статистики
+	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if authKey != "" && r.Header.Get("Authorization") != "Bearer "+authKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		list := getAllStats()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(list)
 	})
@@ -311,7 +375,7 @@ func startPeriodicSend(client *apns2.Client, bundleID string, tokens []string) {
 	log.Println("Запущена периодическая отправка silent push каждые 15 минут")
 }
 
-// sendPeriodic выполняет отправку silent push по всем токенам.
+// sendPeriodic выполняет отправку silent push по всем токенам и обновляет статистику.
 func sendPeriodic(client *apns2.Client, bundleID string, tokens []string) {
 	log.Println("Начинаем периодическую отправку silent push...")
 	pl := payload.NewPayload().ContentAvailable()
@@ -330,10 +394,10 @@ func sendPeriodic(client *apns2.Client, bundleID string, tokens []string) {
 			log.Printf("Периодическая отправка: ошибка для %s: %v", token, err)
 		} else if resp.StatusCode == 200 {
 			log.Printf("Периодическая отправка: успешно на %s", token)
+			updateSentStats(token, "silent")
 		} else {
 			log.Printf("Периодическая отправка: APNs ошибка для %s: %s", token, resp.Reason)
 		}
-		// Небольшая задержка, чтобы не флудить APNs
 		time.Sleep(100 * time.Millisecond)
 	}
 	log.Println("Периодическая отправка завершена")
