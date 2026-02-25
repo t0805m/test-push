@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,37 +15,45 @@ import (
 	"github.com/sideshow/apns2/payload"
 )
 
+// Структура для хранения подтверждения
 type Confirmation struct {
 	DeviceToken string    `json:"device_token"`
 	ReceivedAt  time.Time `json:"received_at"`
 }
 
+// Хранилище подтверждений в памяти
 var (
 	confirmations = make(map[string]Confirmation)
 	mu            sync.RWMutex
 )
 
 func main() {
+	// Загружаем конфигурацию из переменных окружения
 	certBase64 := os.Getenv("APNS_CERT_BASE64")
 	certPassword := os.Getenv("APNS_CERT_PASSWORD")
 	bundleID := os.Getenv("APNS_TOPIC")
 	env := os.Getenv("APNS_ENVIRONMENT")
 	authKey := os.Getenv("AUTH_KEY")
+	deviceTokensStr := os.Getenv("DEVICE_TOKENS")            // для периодической отправки
+	enablePeriodic := os.Getenv("ENABLE_PERIODIC_SEND") == "true"
 
 	if certBase64 == "" || certPassword == "" || bundleID == "" || env == "" {
 		log.Fatal("Не все обязательные переменные окружения установлены: нужны APNS_CERT_BASE64, APNS_CERT_PASSWORD, APNS_TOPIC, APNS_ENVIRONMENT")
 	}
 
+	// Декодируем сертификат из base64
 	certData, err := base64.StdEncoding.DecodeString(certBase64)
 	if err != nil {
 		log.Fatalf("Ошибка декодирования сертификата: %v", err)
 	}
 
+	// Загружаем сертификат p12
 	cert, err := certificate.FromP12Bytes(certData, certPassword)
 	if err != nil {
 		log.Fatalf("Ошибка загрузки сертификата: %v", err)
 	}
 
+	// Создаём клиент APNs с нужным окружением
 	client := apns2.NewClient(cert)
 	if env == "production" {
 		client = client.Production()
@@ -52,7 +61,31 @@ func main() {
 		client = client.Development()
 	}
 
-	http.HandleFunc("/send-silent", func(w http.ResponseWriter, r *http.Request) {
+	// Разбираем device tokens для периодической отправки
+	var periodicTokens []string
+	if enablePeriodic {
+		if deviceTokensStr == "" {
+			log.Fatal("ENABLE_PERIODIC_SEND=true, но DEVICE_TOKENS не задан")
+		}
+		for _, t := range strings.Split(deviceTokensStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				periodicTokens = append(periodicTokens, t)
+			}
+		}
+		if len(periodicTokens) == 0 {
+			log.Fatal("DEVICE_TOKENS не содержит ни одного токена")
+		}
+		log.Printf("Загружено %d device token'ов для периодической отправки", len(periodicTokens))
+	}
+
+	// Запускаем периодическую отправку, если включено
+	if enablePeriodic {
+		startPeriodicSend(client, bundleID, periodicTokens)
+	}
+
+	// Эндпоинт для отправки silent push на один device token
+	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -76,7 +109,6 @@ func main() {
 		}
 
 		pl := payload.NewPayload().ContentAvailable()
-
 		notification := &apns2.Notification{
 			DeviceToken: req.DeviceToken,
 			Topic:       bundleID,
@@ -87,7 +119,6 @@ func main() {
 		}
 
 		resp, err := client.Push(notification)
-
 		result := make(map[string]string)
 		if err != nil {
 			result["status"] = "error"
@@ -106,6 +137,7 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	// Эндпоинт для отправки обычного push
 	http.HandleFunc("/send-simple", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -119,12 +151,12 @@ func main() {
 
 		var req struct {
 			DeviceToken string `json:"device_token"`
-			Title       string `json:"title"`       // заголовок уведомления
-			Body        string `json:"body"`        // текст уведомления
-			Sound       string `json:"sound"`       // опционально, имя звука (по умолчанию "default")
-			Badge       int    `json:"badge"`       // опционально, число на бейдже
-			Category    string `json:"category"`    // опционально, категория для действий
-			ThreadID    string `json:"thread_id"`   // опционально, для группировки
+			Title       string `json:"title"`
+			Body        string `json:"body"`
+			Sound       string `json:"sound"`
+			Badge       int    `json:"badge"`
+			Category    string `json:"category"`
+			ThreadID    string `json:"thread_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -158,13 +190,12 @@ func main() {
 		notification := &apns2.Notification{
 			DeviceToken: req.DeviceToken,
 			Topic:       bundleID,
-			PushType:    apns2.PushTypeAlert, // явно указываем тип
+			PushType:    apns2.PushTypeAlert,
 			Payload:     pl,
 			Expiration:  time.Now().Add(24 * time.Hour),
 		}
 
 		resp, err := client.Push(notification)
-
 		result := make(map[string]string)
 		if err != nil {
 			result["status"] = "error"
@@ -183,6 +214,7 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	// Эндпоинт для подтверждения получения пуша от устройства
 	http.HandleFunc("/confirm", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -218,6 +250,7 @@ func main() {
 		w.Write([]byte(`{"status":"confirmed"}`))
 	})
 
+	// Эндпоинт для просмотра всех подтверждений
 	http.HandleFunc("/confirmations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -240,6 +273,7 @@ func main() {
 		json.NewEncoder(w).Encode(list)
 	})
 
+	// Health check
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -253,4 +287,45 @@ func main() {
 
 	log.Printf("Сервер запущен на порту %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+// startPeriodicSend запускает горутину, которая отправляет silent push по списку токенов каждые 15 минут.
+func startPeriodicSend(client *apns2.Client, bundleID string, tokens []string) {
+	ticker := time.NewTicker(15 * time.Second)
+	go func() {
+		// Сразу выполняем первую отправку при старте
+		sendPeriodic(client, bundleID, tokens)
+		for range ticker.C {
+			sendPeriodic(client, bundleID, tokens)
+		}
+	}()
+	log.Println("Запущена периодическая отправка silent push каждые 15 минут")
+}
+
+// sendPeriodic выполняет отправку silent push по всем токенам.
+func sendPeriodic(client *apns2.Client, bundleID string, tokens []string) {
+	log.Println("Начинаем периодическую отправку silent push...")
+	pl := payload.NewPayload().ContentAvailable()
+	notification := &apns2.Notification{
+		Topic:      bundleID,
+		Priority:   apns2.PriorityLow,
+		PushType:   apns2.PushTypeBackground,
+		Payload:    pl,
+		Expiration: time.Now().Add(24 * time.Hour),
+	}
+
+	for _, token := range tokens {
+		notification.DeviceToken = token
+		resp, err := client.Push(notification)
+		if err != nil {
+			log.Printf("Периодическая отправка: ошибка для %s: %v", token, err)
+		} else if resp.StatusCode == 200 {
+			log.Printf("Периодическая отправка: успешно на %s", token)
+		} else {
+			log.Printf("Периодическая отправка: APNs ошибка для %s: %s", token, resp.Reason)
+		}
+		// Небольшая задержка, чтобы не флудить APNs
+		time.Sleep(100 * time.Millisecond)
+	}
+	log.Println("Периодическая отправка завершена")
 }
