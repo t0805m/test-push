@@ -150,6 +150,14 @@ func main() {
 		startPeriodicSend(client, bundleID, periodicTokens)
 	}
 
+	http.HandleFunc("/test-latency", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	// Эндпоинт для отправки silent push на один device token
 	http.HandleFunc("/send-silent", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
