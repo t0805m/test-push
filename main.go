@@ -15,15 +15,16 @@ import (
 	"github.com/sideshow/apns2/payload"
 )
 
-// Структура для хранения подтверждения
+// Структура для хранения подтверждения со счётчиком
 type Confirmation struct {
 	DeviceToken string    `json:"device_token"`
-	ReceivedAt  time.Time `json:"received_at"`
+	Count       int       `json:"count"`       // сколько раз подтвердил
+	LastSeen    time.Time `json:"last_seen"`   // время последнего подтверждения
 }
 
 // Хранилище подтверждений в памяти
 var (
-	confirmations = make(map[string]Confirmation)
+	confirmations = make(map[string]*Confirmation) // храним указатель для удобства обновления
 	mu            sync.RWMutex
 )
 
@@ -34,7 +35,7 @@ func main() {
 	bundleID := os.Getenv("APNS_TOPIC")
 	env := os.Getenv("APNS_ENVIRONMENT")
 	authKey := os.Getenv("AUTH_KEY")
-	deviceTokensStr := os.Getenv("DEVICE_TOKENS")            // для периодической отправки
+	deviceTokensStr := os.Getenv("DEVICE_TOKENS")
 	enablePeriodic := os.Getenv("ENABLE_PERIODIC_SEND") == "true"
 
 	if certBase64 == "" || certPassword == "" || bundleID == "" || env == "" {
@@ -239,9 +240,17 @@ func main() {
 		}
 
 		mu.Lock()
-		confirmations[req.DeviceToken] = Confirmation{
-			DeviceToken: req.DeviceToken,
-			ReceivedAt:  time.Now(),
+		// Ищем существующую запись
+		if conf, ok := confirmations[req.DeviceToken]; ok {
+			conf.Count++
+			conf.LastSeen = time.Now()
+		} else {
+			// Создаём новую
+			confirmations[req.DeviceToken] = &Confirmation{
+				DeviceToken: req.DeviceToken,
+				Count:       1,
+				LastSeen:    time.Now(),
+			}
 		}
 		mu.Unlock()
 
@@ -250,7 +259,7 @@ func main() {
 		w.Write([]byte(`{"status":"confirmed"}`))
 	})
 
-	// Эндпоинт для просмотра всех подтверждений
+	// Эндпоинт для просмотра всех подтверждений со счётчиками
 	http.HandleFunc("/confirmations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -263,7 +272,7 @@ func main() {
 		}
 
 		mu.RLock()
-		list := make([]Confirmation, 0, len(confirmations))
+		list := make([]*Confirmation, 0, len(confirmations))
 		for _, conf := range confirmations {
 			list = append(list, conf)
 		}
@@ -291,7 +300,7 @@ func main() {
 
 // startPeriodicSend запускает горутину, которая отправляет silent push по списку токенов каждые 15 минут.
 func startPeriodicSend(client *apns2.Client, bundleID string, tokens []string) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(15 * time.Minute)
 	go func() {
 		// Сразу выполняем первую отправку при старте
 		sendPeriodic(client, bundleID, tokens)
