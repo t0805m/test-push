@@ -52,7 +52,7 @@ func main() {
 		client = client.Development()
 	}
 
-	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/send-silent", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -100,6 +100,83 @@ func main() {
 			result["status"] = "apns_error"
 			result["reason"] = resp.Reason
 			log.Printf("Ошибка APNs для %s: %s", req.DeviceToken, resp.Reason)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	http.HandleFunc("/send-simple", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if authKey != "" && r.Header.Get("Authorization") != "Bearer "+authKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		var req struct {
+			DeviceToken string `json:"device_token"`
+			Title       string `json:"title"`       // заголовок уведомления
+			Body        string `json:"body"`        // текст уведомления
+			Sound       string `json:"sound"`       // опционально, имя звука (по умолчанию "default")
+			Badge       int    `json:"badge"`       // опционально, число на бейдже
+			Category    string `json:"category"`    // опционально, категория для действий
+			ThreadID    string `json:"thread_id"`   // опционально, для группировки
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.DeviceToken == "" {
+			http.Error(w, "device_token is required", http.StatusBadRequest)
+			return
+		}
+		if req.Title == "" && req.Body == "" {
+			http.Error(w, "either title or body must be provided", http.StatusBadRequest)
+			return
+		}
+
+		pl := payload.NewPayload().AlertTitle(req.Title).AlertBody(req.Body)
+		if req.Sound != "" {
+			pl.Sound(req.Sound)
+		} else {
+			pl.Sound("default")
+		}
+		if req.Badge > 0 {
+			pl.Badge(req.Badge)
+		}
+		if req.Category != "" {
+			pl.Category(req.Category)
+		}
+		if req.ThreadID != "" {
+			pl.ThreadID(req.ThreadID)
+		}
+
+		notification := &apns2.Notification{
+			DeviceToken: req.DeviceToken,
+			Topic:       bundleID,
+			PushType:    apns2.PushTypeAlert, // явно указываем тип
+			Payload:     pl,
+			Expiration:  time.Now().Add(24 * time.Hour),
+		}
+
+		resp, err := client.Push(notification)
+
+		result := make(map[string]string)
+		if err != nil {
+			result["status"] = "error"
+			result["reason"] = err.Error()
+			log.Printf("Ошибка отправки обычного пуша для %s: %v", req.DeviceToken, err)
+		} else if resp.StatusCode == 200 {
+			result["status"] = "success"
+			log.Printf("Успешно отправлен обычный пуш на %s", req.DeviceToken)
+		} else {
+			result["status"] = "apns_error"
+			result["reason"] = resp.Reason
+			log.Printf("Ошибка APNs для обычного пуша на %s: %s", req.DeviceToken, resp.Reason)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
